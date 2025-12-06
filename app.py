@@ -12,20 +12,129 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
 from PIL import Image
 from gradio_client import Client, handle_file
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
 
-MANIFESTS_DIR = "manifests"
-KEYS_DIR = "keys"
-TRANSPARENCY_LOG = "transparency.log"
+load_dotenv()
 
-os.makedirs(MANIFESTS_DIR, exist_ok=True)
+# AWS S3 Configuration
+S3_BUCKET = os.getenv("S3_BUCKET_NAME", "your-bucket-name")
+S3_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_MANIFESTS_PREFIX = "manifests/"
+S3_SEALED_ITEMS_PREFIX = "sealed_items/"
+S3_KEYS_PREFIX = "keys/"
+
+s3_client = boto3.client("s3", region_name=S3_REGION)
+
+# Local cache directories for keys
+KEYS_DIR = "/tmp/keys"
+LOCAL_MANIFESTS_CACHE = "/tmp/manifests_cache"
+LOCAL_SEALED_CACHE = "/tmp/sealed_cache"
+
 os.makedirs(KEYS_DIR, exist_ok=True)
-if not os.path.exists(TRANSPARENCY_LOG):
-    open(TRANSPARENCY_LOG, "a").close()
+os.makedirs(LOCAL_MANIFESTS_CACHE, exist_ok=True)
+os.makedirs(LOCAL_SEALED_CACHE, exist_ok=True)
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-# Load private key (for PoC). In prod use KMS/HSM.
+TRANSPARENCY_LOG = "transparency.log"
+
+def download_from_s3(s3_key: str, local_path: str) -> bool:
+    """Download file from S3 to local cache"""
+    try:
+        s3_client.download_file(S3_BUCKET, s3_key, local_path)
+        return True
+    except ClientError as e:
+        print(f"Error downloading {s3_key}: {e}")
+        return False
+
+def upload_to_s3(local_path: str, s3_key: str) -> bool:
+    """Upload file to S3"""
+    try:
+        s3_client.upload_file(local_path, S3_BUCKET, s3_key)
+        return True
+    except ClientError as e:
+        print(f"Error uploading {s3_key}: {e}")
+        return False
+
+def get_from_s3(s3_key: str) -> dict:
+    """Get JSON file from S3"""
+    try:
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        return json.loads(obj["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        print(f"Error getting {s3_key}: {e}")
+        return None
+
+def put_to_s3(s3_key: str, data: dict) -> bool:
+    """Put JSON file to S3"""
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=json.dumps(data, indent=2).encode("utf-8"),
+            ContentType="application/json"
+        )
+        return True
+    except ClientError as e:
+        print(f"Error putting {s3_key}: {e}")
+        return False
+
+def list_s3_keys(prefix: str) -> list:
+    """List all keys in S3 with given prefix"""
+    try:
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+        if "Contents" not in response:
+            return []
+        return [obj["Key"] for obj in response["Contents"]]
+    except ClientError as e:
+        print(f"Error listing {prefix}: {e}")
+        return []
+
+# Initialize keys from S3 on startup
+def init_keys():
+    """Download keys from S3 or create new ones"""
+    priv_key_s3 = S3_KEYS_PREFIX + "private_key.pem"
+    pub_key_s3 = S3_KEYS_PREFIX + "public_key.pem"
+    
+    priv_key_local = os.path.join(KEYS_DIR, "private_key.pem")
+    pub_key_local = os.path.join(KEYS_DIR, "public_key.pem")
+    
+    # Try to download from S3
+    if download_from_s3(priv_key_s3, priv_key_local) and download_from_s3(pub_key_s3, pub_key_local):
+        print("Keys loaded from S3")
+        return
+    
+    # If not in S3, generate new keys and upload
+    print("Generating new keys...")
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    priv_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    pub_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    
+    with open(priv_key_local, "wb") as f:
+        f.write(priv_pem)
+    with open(pub_key_local, "wb") as f:
+        f.write(pub_pem)
+    
+    # Upload to S3
+    upload_to_s3(priv_key_local, priv_key_s3)
+    upload_to_s3(pub_key_local, pub_key_s3)
+    print("Keys generated and uploaded to S3")
+
+# Load keys
+init_keys()
+
 with open(os.path.join(KEYS_DIR, "private_key.pem"), "rb") as f:
     PRIVATE_KEY = serialization.load_pem_private_key(f.read(), password=None)
 
@@ -58,36 +167,28 @@ def verify_signature(manifest_bytes: bytes, signature_hex: str):
         return False
 
 def detect_ai_generated(image_bytes: bytes) -> dict:
-    """
-    Detect if image is AI-generated using Gradio API
-    Returns detection metadata including score, label, and model info
-    """
+    """Detect if image is AI-generated using Gradio API"""
     try:
-        # Save image bytes to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
             tmp_file.write(image_bytes)
             tmp_path = tmp_file.name
         
         try:
-            # Call Gradio API
             client = Client("saiaditya004/AIvsREAL")
             result = client.predict(
                 image=handle_file(tmp_path),
                 api_name="/predict"
             )
             
-            # Extract detection results
             label = result.get("label", "unknown")
             confidences = result.get("confidences", [])
             
-            # Find the confidence score for the predicted label
             score = 0.0
             for conf in confidences:
                 if conf.get("label") == label:
                     score = conf.get("confidence", 0.0)
                     break
             
-            # Build detection result
             detection_result = {
                 "model_id": "saiaditya004/AIvsREAL",
                 "model_version": "v1",
@@ -101,7 +202,6 @@ def detect_ai_generated(image_bytes: bytes) -> dict:
             return detection_result
             
         finally:
-            # Clean up temp file
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
                 
@@ -110,25 +210,15 @@ def detect_ai_generated(image_bytes: bytes) -> dict:
 
 @app.route("/.well-known/public-key.pem", methods=["GET"])
 def get_public_key():
-    # Expose public key so verifiers can fetch and use it.
     return send_file(os.path.join(KEYS_DIR, "public_key.pem"), mimetype="application/x-pem-file")
 
 @app.route("/api/sign-manifest", methods=["POST"])
 def sign_manifest():
-    """
-    Expected JSON payload:
-    {
-      "image_hash": "sha256:abcd...",
-      "capture": {...},
-      "detection": {...},
-      "uploader": {...}
-    }
-    """
+    """Sign manifest and store in S3"""
     data = request.get_json()
     if not data or "image_hash" not in data:
         return jsonify({"error": "image_hash required"}), 400
 
-    # Build canonical manifest structure
     manifest = {
         "asset": {"hash": data["image_hash"]},
         "capture": data.get("capture", {}),
@@ -138,12 +228,7 @@ def sign_manifest():
         "version": "v1"
     }
 
-    # canonicalize and compute manifest hash (SHA-256 of sorted JSON)
     manifest_hash = sha256_hex_of_json(manifest)
-    manifest_filename = f"{manifest_hash}.json"
-    manifest_path = os.path.join(MANIFESTS_DIR, manifest_filename)
-
-    # Sign the manifest bytes (canonical JSON)
     manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode('utf-8')
     signature_hex = sign_bytes(manifest_bytes)
 
@@ -156,13 +241,10 @@ def sign_manifest():
         }
     }
 
-    # Write signed manifest file (human-readable)
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(signed_manifest, f, indent=2)
-
-    # Append to a simple transparency log (manifest_hash and timestamp)
-    with open(TRANSPARENCY_LOG, "a") as t:
-        t.write(json.dumps({"manifest_hash": manifest_hash, "issued_at": signed_manifest["manifest"]["issued_at"]}) + "\n")
+    # Store in S3
+    s3_key = S3_MANIFESTS_PREFIX + f"{manifest_hash}.json"
+    if not put_to_s3(s3_key, signed_manifest):
+        return jsonify({"error": "Failed to save manifest"}), 500
 
     manifest_url = request.url_root.rstrip("/") + f"/manifests/{manifest_hash}"
     return jsonify({
@@ -174,43 +256,41 @@ def sign_manifest():
 
 @app.route("/manifests/<manifest_hash>", methods=["GET"])
 def fetch_manifest(manifest_hash):
-    path = os.path.join(MANIFESTS_DIR, f"{manifest_hash}.json")
-    if not os.path.exists(path):
+    """Fetch manifest from S3"""
+    s3_key = S3_MANIFESTS_PREFIX + f"{manifest_hash}.json"
+    manifest_data = get_from_s3(s3_key)
+    
+    if not manifest_data:
         return jsonify({"error": "manifest not found"}), 404
-    return send_file(path, mimetype="application/json")
+    
+    return jsonify(manifest_data)
 
 @app.route("/api/verify-manifest", methods=["GET"])
 def verify_manifest():
-    """
-    Query param: url or manifest_hash
-    If manifest_url given, fetch internal file; if manifest_hash, use it.
-    Returns: { ok, signature_valid, manifest, errors: [] }
-    """
+    """Verify manifest signature"""
     manifest_url = request.args.get("url")
     manifest_hash = request.args.get("manifest_hash")
+    
     if manifest_url:
-        # for this PoC, manifest_url should point to our /manifests/<hash>
-        # extract last path segment
         manifest_hash = manifest_url.rstrip("/").split("/")[-1]
 
     if not manifest_hash:
         return jsonify({"error": "url or manifest_hash required"}), 400
 
-    path = os.path.join(MANIFESTS_DIR, f"{manifest_hash}.json")
-    if not os.path.exists(path):
+    s3_key = S3_MANIFESTS_PREFIX + f"{manifest_hash}.json"
+    signed_manifest = get_from_s3(s3_key)
+    
+    if not signed_manifest:
         return jsonify({"error": "manifest not found"}), 404
 
-    signed_manifest = json.load(open(path, "r", encoding="utf-8"))
     manifest = signed_manifest.get("manifest")
     signature = signed_manifest.get("signature")
+    
     if not manifest or not signature:
         return jsonify({"error": "invalid manifest format"}), 500
 
-    # verify signature
     manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode('utf-8')
     signature_valid = verify_signature(manifest_bytes, signature)
-
-    # simple trust determination (in PoC): if signature_valid -> server-signed
     trust_level = "server-signed" if signature_valid else "invalid-signature"
 
     return jsonify({
@@ -224,21 +304,20 @@ def verify_manifest():
 
 @app.route("/api/verify-asset", methods=["POST"])
 def verify_asset():
-    """
-    Accepts JSON:
-    { "manifest_hash": "<hex>", "image_hash": "sha256:..." }
-    Verifies that image_hash matches manifest.asset.hash and signature is valid.
-    """
+    """Verify asset against manifest"""
     data = request.get_json()
     if not data or "manifest_hash" not in data or "image_hash" not in data:
         return jsonify({"error": "manifest_hash and image_hash required"}), 400
+    
     manifest_hash = data["manifest_hash"]
     image_hash = data["image_hash"]
-    path = os.path.join(MANIFESTS_DIR, f"{manifest_hash}.json")
-    if not os.path.exists(path):
+    
+    s3_key = S3_MANIFESTS_PREFIX + f"{manifest_hash}.json"
+    signed_manifest = get_from_s3(s3_key)
+    
+    if not signed_manifest:
         return jsonify({"error": "manifest not found"}), 404
 
-    signed_manifest = json.load(open(path, "r", encoding="utf-8"))
     manifest = signed_manifest.get("manifest")
     signature = signed_manifest.get("signature")
     manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -263,86 +342,55 @@ def verify_asset():
 
 @app.route("/api/lookup-by-hash", methods=["GET"])
 def lookup_by_hash():
-    """
-    Query param: image_hash (e.g., sha256:abc123...)
-    Returns: { found: bool, manifest_hash?: string, manifest_url?: string }
-    """
+    """Lookup manifest by image hash"""
     image_hash = request.args.get("image_hash")
     if not image_hash:
         return jsonify({"error": "image_hash required"}), 400
     
-    # Search through all manifest files for matching asset.hash
-    for filename in os.listdir(MANIFESTS_DIR):
-        if not filename.endswith(".json"):
+    manifest_keys = list_s3_keys(S3_MANIFESTS_PREFIX)
+    
+    for s3_key in manifest_keys:
+        signed_manifest = get_from_s3(s3_key)
+        if not signed_manifest:
             continue
-        path = os.path.join(MANIFESTS_DIR, filename)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                signed_manifest = json.load(f)
-                manifest = signed_manifest.get("manifest", {})
-                asset_hash = manifest.get("asset", {}).get("hash")
-                
-                if asset_hash == image_hash:
-                    manifest_hash = filename.replace(".json", "")
-                    manifest_url = request.url_root.rstrip("/") + f"/manifests/{manifest_hash}"
-                    return jsonify({
-                        "found": True,
-                        "manifest_hash": manifest_hash,
-                        "manifest_url": manifest_url,
-                        "manifest": manifest
-                    })
-        except:
-            continue
+        
+        manifest = signed_manifest.get("manifest", {})
+        asset_hash = manifest.get("asset", {}).get("hash")
+        
+        if asset_hash == image_hash:
+            manifest_hash = s3_key.replace(S3_MANIFESTS_PREFIX, "").replace(".json", "")
+            manifest_url = request.url_root.rstrip("/") + f"/manifests/{manifest_hash}"
+            return jsonify({
+                "found": True,
+                "manifest_hash": manifest_hash,
+                "manifest_url": manifest_url,
+                "manifest": manifest
+            })
     
     return jsonify({"found": False})
 
 @app.route("/api/detect-ai", methods=["POST"])
 def detect_ai_endpoint():
-    """
-    AI Detection API Endpoint
-    
-    Expected JSON payload:
-    {
-      "image": "base64_encoded_image_string",
-      "image_type": "jpeg" or "png" (optional, default: "jpeg")
-    }
-    
-    Returns:
-    {
-      "success": true,
-      "detection": {
-        "model_id": "...",
-        "model_version": "...",
-        "model_hash": "...",
-        "score": 0.XX,
-        "label": "...",
-        "processed_at": "2025-11-14T..."
-      }
-    }
-    """
+    """AI Detection endpoint"""
     try:
         data = request.get_json()
         
         if not data or "image" not in data:
             return jsonify({"success": False, "error": "image (base64) required"}), 400
         
-        # Decode base64 image
         try:
             image_base64 = data["image"]
             image_bytes = base64.b64decode(image_base64)
         except Exception as e:
             return jsonify({"success": False, "error": f"Invalid base64 image: {str(e)}"}), 400
         
-        # Validate image can be opened
         try:
             img = Image.open(io.BytesIO(image_bytes))
-            img.verify()  # Verify it's a valid image
-            # Reopen after verify (verify closes the file)
+            img.verify()
             image_bytes = base64.b64decode(image_base64)
         except Exception as e:
             return jsonify({"success": False, "error": f"Invalid image file: {str(e)}"}), 400
         
-        # Run AI detection
         detection_result = detect_ai_generated(image_bytes)
         
         return jsonify({
@@ -356,43 +404,22 @@ def detect_ai_endpoint():
             "error": str(e)
         }), 500
 
-SEALED_ITEMS_DIR = "sealed_items"
-os.makedirs(SEALED_ITEMS_DIR, exist_ok=True)
-
 @app.route("/api/sealed-items", methods=["GET"])
 def list_sealed_items():
-    """
-    Query param: user_id (optional, for multi-user support)
-    Returns: { items: [SealedImageItem[]] }
-    """
+    """List sealed items for user from S3"""
     user_id = request.args.get("user_id", "default_user")
-    user_file = os.path.join(SEALED_ITEMS_DIR, f"{user_id}.json")
+    s3_key = S3_SEALED_ITEMS_PREFIX + f"{user_id}.json"
     
-    if not os.path.exists(user_file):
+    items = get_from_s3(s3_key)
+    if not items:
         return jsonify({"items": []})
     
-    with open(user_file, "r", encoding="utf-8") as f:
-        items = json.load(f)
-    
-    # Sort by sealed_at (newest first)
     items.sort(key=lambda x: x.get("sealed_at", ""), reverse=True)
     return jsonify({"items": items})
 
 @app.route("/api/sealed-items", methods=["POST"])
 def save_sealed_item():
-    """
-    Expected JSON payload:
-    {
-      "user_id": "optional",
-      "item": {
-        "imageUri": "...",
-        "imageHash": "sha256:...",
-        "manifest_url": "...",
-        "manifest_hash": "sha256:...",
-        "sealed_at": "2025-11-13T..."
-      }
-    }
-    """
+    """Save sealed item to S3"""
     data = request.get_json()
     if not data or "item" not in data:
         return jsonify({"error": "item required"}), 400
@@ -400,61 +427,47 @@ def save_sealed_item():
     user_id = data.get("user_id", "default_user")
     item = data["item"]
     
-    # Validate required fields
     if not item.get("imageHash") or not item.get("manifest_url"):
         return jsonify({"error": "imageHash and manifest_url required"}), 400
     
-    user_file = os.path.join(SEALED_ITEMS_DIR, f"{user_id}.json")
+    s3_key = S3_SEALED_ITEMS_PREFIX + f"{user_id}.json"
     
     # Load existing items
-    items = []
-    if os.path.exists(user_file):
-        with open(user_file, "r", encoding="utf-8") as f:
-            items = json.load(f)
+    items = get_from_s3(s3_key)
+    if not items:
+        items = []
     
-    # Add timestamp if not present
     if "sealed_at" not in item:
         item["sealed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     
-    # Deduplicate by imageHash (remove old entry if exists)
     items = [i for i in items if i.get("imageHash") != item["imageHash"]]
-    items.insert(0, item)  # Add to front (newest first)
+    items.insert(0, item)
     
-    # Save updated list
-    with open(user_file, "w", encoding="utf-8") as f:
-        json.dump(items, f, indent=2)
+    if not put_to_s3(s3_key, items):
+        return jsonify({"error": "Failed to save item"}), 500
     
     return jsonify({"success": True, "item": item}), 201
 
 @app.route("/api/sealed-items/<image_hash>", methods=["DELETE"])
 def delete_sealed_item(image_hash):
-    """
-    Delete a sealed item by imageHash
-    Query param: user_id (optional)
-    """
+    """Delete sealed item from S3"""
     user_id = request.args.get("user_id", "default_user")
-    user_file = os.path.join(SEALED_ITEMS_DIR, f"{user_id}.json")
+    s3_key = S3_SEALED_ITEMS_PREFIX + f"{user_id}.json"
     
-    if not os.path.exists(user_file):
+    items = get_from_s3(s3_key)
+    if not items:
         return jsonify({"error": "not found"}), 404
     
-    with open(user_file, "r", encoding="utf-8") as f:
-        items = json.load(f)
-    
-    # Find and remove item
     original_count = len(items)
     items = [i for i in items if i.get("imageHash") != image_hash]
     
     if len(items) == original_count:
         return jsonify({"error": "item not found"}), 404
     
-    # Save updated list
-    with open(user_file, "w", encoding="utf-8") as f:
-        json.dump(items, f, indent=2)
+    if not put_to_s3(s3_key, items):
+        return jsonify({"error": "Failed to delete item"}), 500
     
     return jsonify({"success": True, "deleted": image_hash})
 
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
