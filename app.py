@@ -167,46 +167,35 @@ def verify_signature(manifest_bytes: bytes, signature_hex: str):
         return False
 
 def detect_ai_generated(image_bytes: bytes) -> dict:
-    """Detect if image is AI-generated using Gradio API"""
+    """
+    Detect if image is AI-generated using Hugging Face FastAPI Space
+    """
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
-            tmp_file.write(image_bytes)
-            tmp_path = tmp_file.name
-        
-        try:
-            client = Client("saiaditya004/AIvsREAL")
-            result = client.predict(
-                image=handle_file(tmp_path),
-                api_name="/predict"
-            )
-            
-            label = result.get("label", "unknown")
-            confidences = result.get("confidences", [])
-            
-            score = 0.0
-            for conf in confidences:
-                if conf.get("label") == label:
-                    score = conf.get("confidence", 0.0)
-                    break
-            
-            detection_result = {
-                "model_id": "saiaditya004/AIvsREAL",
-                "model_version": "v1",
-                "model_hash": "gradio-api",
-                "score": round(score, 4),
-                "label": label,
-                "all_confidences": confidences,
-                "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            }
-            
-            return detection_result
-            
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-                
-    except Exception as e:
-        raise Exception(f"AI detection failed: {str(e)}")
+        files = {
+            "file": ("image.png", image_bytes, "image/png")
+        }
+
+        response = requests.post(
+            HF_FASTAPI_URL,
+            files=files,
+            timeout=30
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        return {
+            "model_id": "saiaditya004/AIvsREAL",
+            "model_version": "v1",
+            "model_hash": "hf-fastapi-space",
+            "label": result["label"],
+            "score": round(result["score"], 4),
+            "all_confidences": result["confidences"],
+            "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        }
+
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"HF inference failed: {str(e)}")
 
 @app.route("/.well-known/public-key.pem", methods=["GET"])
 def get_public_key():
