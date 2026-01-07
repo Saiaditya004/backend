@@ -11,10 +11,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
 from PIL import Image
-from gradio_client import Client, handle_file
 import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
+import requests
+
+HF_FASTAPI_URL = "https://saiaditya004-aivsreal-api.hf.space/predict"
 
 load_dotenv()
 
